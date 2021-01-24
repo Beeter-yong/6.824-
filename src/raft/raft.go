@@ -20,6 +20,8 @@ package raft
 import "sync"
 import "sync/atomic"
 import "../labrpc"
+import "time"
+import "math/rand"
 
 // import "bytes"
 // import "../labgob"
@@ -43,6 +45,14 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+type Role string
+
+const (
+	Leader 		Role = "Leader"
+	Candidate 	Role = "Candidate"
+	Follower	Role = "Follower"
+)
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -57,6 +67,17 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	role 			Role
+	// 持久化属性
+	currentTerm		int
+	votedFor		int	// 当前 term 下将票投给了哪个 Candidate，默认值 -1
+
+	// 易失性属性
+	lastActiveTime	time.Time
+	lastHeartTime	time.Time
+
+	voteCount		int
+
 }
 
 // return currentTerm and whether this server
@@ -66,6 +87,10 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	term = rf.currentTerm
+	isleader = rf.role == Leader
 	return term, isleader
 }
 
@@ -117,6 +142,8 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term			int 
+	CandidateId		int
 }
 
 //
@@ -125,6 +152,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term			int
+	VoteGranted		bool	// 是否将票投给了 Candidate
 }
 
 //
@@ -132,6 +161,77 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	
+	DPrintf("[%d] 收到 Candidate([%d]，term[%d] 的请求投票", rf.me, args.CandidateId, args.Term)
+
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = false
+
+	if args.Term < rf.currentTerm {
+		DPrintf("[%d] Candidate[%d] 的 term 太小，拒绝请求", rf.me, args.Term)
+		return
+	}
+
+	// 无论何种情况，遇到比自己更大的 Term 都要更新状态到 Follower
+	if args.Term > rf.currentTerm {
+		// DPrintf("[%d] Candidate[%d] 的 term 更大", rf.me, args.Term)
+		rf.role = Follower
+		rf.votedFor = -1
+		rf.currentTerm = args.Term
+		reply.Term = rf.currentTerm
+	}
+	
+	// 已经投过票就不再进行投票了,有可能延时 Candidate 重发
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+		rf.votedFor = args.CandidateId
+		rf.lastActiveTime = time.Now()
+		rf.currentTerm = args.Term
+		reply.VoteGranted = true
+		DPrintf("[%d] 投票给 Candidate[%d]", rf.me, args.CandidateId)
+	}
+
+	return
+}
+
+
+type AppendEntriesArgs struct {
+	Term 			int
+	LeaderId		int
+}
+
+type AppendEntriesReply struct {
+	Term			int
+	Success			bool	// 是否接收 Leader 发来的日志
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	// rf.mu.Lock()
+	// defer rf.mu.Unlock()
+
+	DPrintf("[%d] 接收到来自 Leader[%d] 的心跳信息", rf.me, args.LeaderId)
+
+	reply.Term = rf.currentTerm
+	reply.Success = false
+
+
+	if args.Term < rf.currentTerm {
+		DPrintf("[%d] Leader[%d] 的 Term 太小", rf.me, args.LeaderId)
+		return
+	}
+
+	// 无论是什么状态，只要有 Term 比自己大就转为 Follower
+	if args.Term > rf.currentTerm {
+		// DPrintf("[%d] Leader[%d] 的 Term 更大", rf.me, args.LeaderId)
+		rf.currentTerm = args.Term
+		rf.role = Follower
+		rf.votedFor = -1
+	}
+	
+	rf.lastActiveTime = time.Now()
+
+	return
 }
 
 //
@@ -167,6 +267,135 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+func (rf *Raft) attempBecomeLeader() {
+
+	for !rf.killed(){
+		time.Sleep(1 * time.Millisecond)
+		func ()  {
+			// rf.mu.Lock()
+			// defer rf.mu.Unlock()
+
+			timeout := time.Duration(1000+rand.Int31n(150)) * time.Millisecond
+			// DPrintf("超时时间：%d", timeout)
+			lifeTimeDiff := time.Now().Sub(rf.lastActiveTime)
+
+			if rf.role == Follower {
+				if lifeTimeDiff > timeout {
+					rf.role = Candidate
+				}
+			}
+			if rf.role == Candidate {
+				
+				if lifeTimeDiff > timeout {
+					rf.lastActiveTime = time.Now()
+					
+					// 并发请求投票
+					rf.currentTerm += 1
+					rf.votedFor = rf.me
+					DPrintf("[%d] 成为 Candidate，term=[%d]", rf.me, rf.currentTerm)
+					args := RequestVoteArgs{}
+					args.Term = rf.currentTerm
+					args.CandidateId = rf.me
+					rf.voteCount = 1	// 先给自己投上一票
+					for i := 0; i < len(rf.peers); i++ {
+						if i == rf.me {
+							continue
+						}
+						reply := RequestVoteReply{}
+						go func(serverId int) {
+							// DPrintf("[%d] 向 [%d] 请求投票", rf.me, serverId)
+			
+							sendTime := time.Now()
+							ok := rf.sendRequestVote(serverId, &args, &reply)
+							DPrintf("[%d] 向 [%d] 请求投票,返回值为 [%v]，用时：%v", rf.me, serverId, reply.VoteGranted, time.Now().Sub(sendTime))
+							if ok && reply.VoteGranted{
+								if reply.Term > rf.currentTerm {
+									rf.role = Follower
+									rf.votedFor = -1
+									rf.lastActiveTime = time.Now()
+									rf.currentTerm = reply.Term
+									return
+								}
+								rf.voteCount += 1
+							}
+						}(i)					
+					}
+					for rf.role == Candidate{
+						time.Sleep(1 * time.Millisecond)
+						// DPrintf("[%d] 当前票数是:%d", rf.me, rf.voteCount)
+						if rf.voteCount > len(rf.peers)/2 {
+							DPrintf("[%d] 成为 Leader", rf.me)
+							rf.voteCount = 0
+							rf.role = Leader
+							rf.lastActiveTime = time.Now()
+							rf.lastHeartTime = time.Now()	// 成为 Leader 后应该马上开始心跳				
+						} else {
+							// DPrintf("当前投票进行时间差：%v", time.Now().Sub(rf.lastActiveTime))
+							if time.Now().Sub(rf.lastActiveTime) > timeout {
+								DPrintf("超时了")
+								return
+							}
+						}
+						
+					}
+					
+				}
+				
+			}
+			
+		}()
+		
+				
+	}
+}
+
+func (rf *Raft) leaderTryHeart()  {
+
+	for !rf.killed() {
+		time.Sleep(1 * time.Millisecond)
+		func ()  {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			
+			if rf.role != Leader {
+				return
+			}
+			if time.Now().Sub(rf.lastHeartTime) < 100 * time.Millisecond {
+				return
+			}
+
+			rf.lastHeartTime = time.Now()
+			// 并发发出心跳
+			args := AppendEntriesArgs{}
+			args.Term = rf.currentTerm
+			args.LeaderId = rf.me
+
+			
+			for i := 0; i < len(rf.peers); i++ {
+				go func(serverId int) {
+					reply := AppendEntriesReply{}
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
+					DPrintf("[%d] 发送心跳给 [%d]", rf.me, serverId)
+					rf.sendAppendEntries(serverId, &args, &reply)
+					if reply.Term > rf.currentTerm {
+						rf.role = Follower
+						rf.votedFor = -1
+						return
+					}
+				}(i)
+			}
+		}()				
+	}
+	
+}
+
 
 
 //
@@ -234,6 +463,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+
+	rf.votedFor = -1
+	rf.role = Follower
+	rf.lastActiveTime = time.Now()
+
+	DPrintf("[%d] 初始化完成", rf.me)
+	go rf.attempBecomeLeader()
+	go rf.leaderTryHeart()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())

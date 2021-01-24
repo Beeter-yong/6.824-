@@ -1,0 +1,12 @@
+Test (2A): initial election ...
+  ... Passed --   3.6  3   80    9610    0
+Test (2A): election after network failure ...
+通过0：产生新的 Leader
+通过1：leader 宕机就会产生新的 Leader
+通过2：leader 宕机又复活，不影响旧的 Leader
+通过3：2 个节点宕机将无法产生新的 Leader
+通过4：恢复一个节点，则可以产生新的 Leader
+通过5：再恢复一个节点，不影响旧的 Leader
+  ... Passed --  20.2  3  288   34072    0
+PASS
+ok  	_/home/6.824/src/raft	23.839s
